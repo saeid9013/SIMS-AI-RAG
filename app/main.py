@@ -32,7 +32,7 @@ async def lifespan(app):
     yield
     worker.close()
 
-app=FastAPI(title='SIMS-AI',version='0.1.0',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
+app=FastAPI(title='SIMS-AI',version='0.2.0',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
 app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 templates=Jinja2Templates(directory=ROOT/'templates')
 
@@ -93,7 +93,7 @@ def render(request,name,u,**context):
 
 @app.get('/health')
 async def health():
-    return {'status':'ok','version':'0.1.0'}
+    return {'status':'ok','version':'0.2.0'}
 
 @app.get('/login')
 async def login_page(request:Request):
@@ -275,14 +275,15 @@ async def admin_page(request:Request,u=Depends(admin)):
     with connect() as db:
         users=db.execute('SELECT id,username,role,active FROM users ORDER BY id').fetchall()
         events=db.execute('SELECT * FROM audit ORDER BY id DESC LIMIT 30').fetchall()
+        accepted_runs=db.execute("SELECT id FROM training_runs WHERE status='accepted' ORDER BY id DESC").fetchall()
     return render(request,'admin.html',u,cfg=settings(),users=users,events=events,
-                  embedding=bool(config.EMBED_MODEL),online_key=bool(config.ONLINE_KEY))
+                  embedding=bool(config.EMBED_MODEL),online_key=bool(config.ONLINE_KEY),accepted_runs=accepted_runs)
 
 @app.post('/admin/settings')
 async def change_settings(request:Request,u=Depends(admin)):
     form=await form_data(request,u)
     mode=str(form.get('mode',''))
-    if mode not in ('extractive','local','online'):
+    if mode not in ('extractive','local','online','adapter'):
         raise HTTPException(400,'حالت نامعتبر است.')
     enabled='true' if form.get('online_enabled')=='on' else 'false'
     local=str(form.get('local_model','')).strip()[:120]
@@ -291,8 +292,14 @@ async def change_settings(request:Request,u=Depends(admin)):
         raise HTTPException(400,'حالت آنلاین به اجازه صریح، کلید محیطی و نام مدل نیاز دارد.')
     if mode=='local' and not local:
         raise HTTPException(400,'نام مدل محلی را وارد کنید.')
+    active_run=str(form.get('active_training_run','')).strip()
+    if mode=='adapter':
+        with connect() as db:
+            accepted=db.execute("SELECT id FROM training_runs WHERE id=? AND status='accepted'",(active_run,)).fetchone()
+        if not accepted:
+            raise HTTPException(400,'نسخه آموزشی پذیرفته‌شده را انتخاب کنید.')
     with connect() as db:
-        for k,v in {'mode':mode,'online_enabled':enabled,'local_model':local,'online_model':online}.items():
+        for k,v in {'active_training_run':active_run,'mode':mode,'online_enabled':enabled,'local_model':local,'online_model':online}.items():
             db.execute('UPDATE settings SET value=? WHERE key=?',(v,k))
         audit(db,u['id'],'settings',mode)
     return redirect('/admin','تنظیمات ذخیره شد.')
@@ -349,3 +356,101 @@ async def change_password(request:Request,u=Depends(user)):
         db.execute('DELETE FROM sessions WHERE user_id=?',(u['id'],))
         audit(db,u['id'],'change_password')
     return redirect('/login')
+
+@app.get('/learning')
+async def learning_page(request:Request,u=Depends(admin)):
+    from .learning import trainer_ready
+    review=request.query_params.get('review','pending')
+    if review not in ('pending','approved','rejected'):
+        review='pending'
+    try:page=max(1,int(request.query_params.get('page','1')))
+    except ValueError:page=1
+    with connect() as db:
+        docs=db.execute("SELECT id,name,revision,chunk_count FROM documents WHERE status='ready' ORDER BY id").fetchall()
+        jobs=db.execute('SELECT id,kind,status,progress,total,error,created FROM learning_jobs ORDER BY id DESC LIMIT 20').fetchall()
+        samples=db.execute('SELECT * FROM learning_samples WHERE review=? ORDER BY id DESC LIMIT 20 OFFSET ?',
+                           (review,(page-1)*20)).fetchall()
+        counts={r['review']:r['n'] for r in db.execute('SELECT review,COUNT(*) n FROM learning_samples GROUP BY review')}
+        runs=db.execute('SELECT * FROM training_runs ORDER BY id DESC LIMIT 20').fetchall()
+    ready,reason=trainer_ready()
+    return render(request,'learning.html',u,documents=docs,jobs=jobs,samples=samples,counts=counts,
+                  runs=runs,review=review,page=page,trainer_ready=ready,trainer_reason=reason,cfg=settings())
+
+@app.post('/learning/teacher')
+async def teacher_job(request:Request,u=Depends(admin)):
+    from .learning import create_teacher_job
+    form=await form_data(request,u)
+    try:
+        if form.get('all_documents')=='on':
+            with connect() as db:
+                ids=[r['id'] for r in db.execute("SELECT id FROM documents WHERE status='ready'")]
+        else:ids=list({int(v) for v in form.getlist('document_id')})
+        job=create_teacher_job(ids,u['id'],form.get('consent')=='on')
+    except ValueError as exc:
+        raise HTTPException(400,str(exc))
+    return redirect('/learning',f'کار {job} ثبت شد. هر قطعه یک درخواست به مدل آنلاین خواهد داشت؛ هزینه با سرویس تنظیم‌شده است.')
+
+@app.post('/learning/samples/{sample_id}/review')
+async def review_sample(sample_id:int,request:Request,u=Depends(admin)):
+    form=await form_data(request,u)
+    decision=str(form.get('decision',''))
+    if decision not in ('approved','rejected'):
+        raise HTTPException(400,'تصمیم نامعتبر است.')
+    with connect() as db:
+        if not db.execute('SELECT id FROM learning_samples WHERE id=?',(sample_id,)).fetchone():
+            raise HTTPException(404,'نمونه پیدا نشد.')
+        db.execute('UPDATE learning_samples SET review=?,reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP WHERE id=?',
+                   (decision,u['id'],sample_id))
+        audit(db,u['id'],'sample_review',f'{sample_id}:{decision}')
+    return redirect('/learning','تصمیم بازبینی ثبت شد. نسخه‌های آموزشی قبلی تغییر نمی‌کنند.')
+
+@app.post('/learning/train')
+async def queue_training(request:Request,u=Depends(admin)):
+    from .learning import create_training_run
+    form=await form_data(request,u)
+    if form.get('confirm_training')!='on':
+        raise HTTPException(400,'شروع آموزش روی سخت‌افزار تنظیم‌شده را تأیید کنید.')
+    try:run=create_training_run(u['id'])
+    except ValueError as exc:raise HTTPException(400,str(exc))
+    return redirect('/learning',f'نسخه آموزشی {run} از تمام نمونه‌های تأییدشده و اسناد موجود ساخته و در صف قرار گرفت.')
+
+@app.post('/learning/jobs/{job_id}/cancel')
+async def cancel_learning(job_id:int,request:Request,u=Depends(admin)):
+    await form_data(request,u)
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row=db.execute('SELECT * FROM learning_jobs WHERE id=?',(job_id,)).fetchone()
+        if not row or row['status'] not in ('queued','running'):
+            raise HTTPException(409,'کار قابل لغو نیست.')
+        db.execute("UPDATE learning_jobs SET status='cancelled' WHERE id=?",(job_id,))
+        db.execute("UPDATE training_runs SET status='cancelled' WHERE job_id=?",(job_id,))
+        audit(db,u['id'],'cancel_learning',str(job_id))
+    return redirect('/learning','درخواست لغو ثبت شد. درخواست آنلاین در حال ارسال ممکن است تکمیل شود؛ درخواست جدیدی ارسال نمی‌شود.')
+
+@app.post('/learning/runs/{run_id}/accept')
+async def accept_training(run_id:int,request:Request,u=Depends(admin)):
+    form=await form_data(request,u)
+    if form.get('benchmark_passed')!='on':
+        raise HTTPException(400,'ارزیابی مستقل کیفیت و عدم افت نسبت به مدل پایه باید تأیید شود.')
+    with connect() as db:
+        cur=db.execute("UPDATE training_runs SET status='accepted',accepted_by=?,accepted_at=CURRENT_TIMESTAMP WHERE id=? AND status='trained'",
+                       (u['id'],run_id))
+        if not cur.rowcount:raise HTTPException(409,'فقط آموزش کامل‌شده قابل پذیرش است.')
+        audit(db,u['id'],'accept_training',str(run_id))
+    return redirect('/learning','پذیرش ثبت شد؛ پس از اجرای سرویس adapter، آن را از تنظیم مدل انتخاب کنید. فعال‌سازی خودکار نیست.')
+
+@app.get('/learning/runs/{run_id}/{artifact}')
+async def training_artifact(run_id:int,artifact:str,u=Depends(admin)):
+    from .learning import run_directory
+    if artifact not in ('manifest.json','metrics.json','trainer.log'):
+        raise HTTPException(404,'خروجی نامعتبر است.')
+    with connect() as db:
+        run=db.execute('SELECT * FROM training_runs WHERE id=?',(run_id,)).fetchone()
+    if not run:raise HTTPException(404,'نسخه پیدا نشد.')
+    if artifact=='manifest.json':
+        from fastapi.responses import Response
+        return Response(run['manifest'],media_type='application/json',
+                        headers={'Content-Disposition':f'attachment; filename="run-{run_id}-manifest.json"'})
+    path=run_directory(run_id)/artifact
+    if not path.is_file():raise HTTPException(404,'خروجی هنوز ساخته نشده است.')
+    return FileResponse(path,filename=f'run-{run_id}-{artifact}',media_type='text/plain' if artifact.endswith('.log') else 'application/json')

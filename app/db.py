@@ -45,6 +45,11 @@ def init_db():
           id INTEGER PRIMARY KEY, user_id INTEGER, action TEXT NOT NULL, detail TEXT NOT NULL,
           created TEXT DEFAULT CURRENT_TIMESTAMP);
         ''')
+        columns={r['name'] for r in db.execute('PRAGMA table_info(chunks)')}
+        if 'embedding_profile' not in columns:
+            db.execute("ALTER TABLE chunks ADD COLUMN embedding_profile TEXT NOT NULL DEFAULT ''")
+        from .learning import init_learning
+        init_learning(db)
         for k, v in {'mode':'extractive', 'local_model':'', 'online_model':'', 'online_enabled':'false'}.items():
             db.execute('INSERT OR IGNORE INTO settings VALUES (?,?)', (k,v))
 

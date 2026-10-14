@@ -21,7 +21,7 @@ def answer(question, sources, cfg):
     if mode == 'extractive':
         return 'بخش‌های مرتبط از اسناد (بدون تولید پاسخ توسط مدل):\n\n' + '\n\n'.join(
             f"[{s['label']}] {s['text']}" for s in sources)
-    if mode not in ('local','online'):
+    if mode not in ('local','online','adapter'):
         raise ProviderError('حالت مدل معتبر نیست.')
     if mode == 'online' and (cfg['online_enabled']!='true' or not config.ONLINE_KEY):
         raise ProviderError('ارسال آنلاین مجاز یا کلید سرویس تنظیم نشده است.')
@@ -32,14 +32,17 @@ def answer(question, sources, cfg):
         messages = [{'role':'system','content':SYSTEM},
                     {'role':'user','content':f'شواهد:\n{context}\n\nپرسش کاربر:\n{question}'}]
         with httpx.Client(timeout=httpx.Timeout(180,connect=10),trust_env=False) as client:
-            if mode == 'local':
-                if not cfg['local_model']:
+            if mode in ('local','adapter'):
+                if mode=='local' and not cfg['local_model']:
                     raise ProviderError('نام مدل محلی توسط مدیر تنظیم نشده است.')
-                response = client.post(config.OLLAMA_URL+'/api/chat', json={
+                response = client.post((config.ADAPTER_URL if mode=='adapter' else config.OLLAMA_URL)+'/api/chat', json={
                     'model':cfg['local_model'],'messages':messages,'stream':False,
                     'keep_alive':'5m','options':{'temperature':0,'num_ctx':8192,'num_predict':900,'num_thread':5}})
                 response.raise_for_status()
-                text = response.json()['message']['content']
+                data=response.json()
+                if mode=='adapter' and str(data.get('run_id',''))!=cfg.get('active_training_run'):
+                    raise ProviderError('سرویس adapter نسخه انتخاب‌شده را اجرا نمی‌کند.')
+                text = data['message']['content']
             else:
                 if not config.ONLINE_URL.startswith('https://'):
                     raise ProviderError('سرویس آنلاین باید HTTPS باشد.')
