@@ -32,3 +32,12 @@ The original local development history remains available in the earlier release 
 
 Repository: https://github.com/saeid9013/SIMS-AI-RAG
 CI evidence: https://github.com/saeid9013/SIMS-AI-RAG/actions/runs/38633322247
+
+## Version 0.2 — reviewed teacher data, LoRA and retrieval quality
+- 33 automated tests passed locally, including authorization/CSRF, teacher consent and structural grounding, numeric witness validation, grouped train/validation/test isolation, immutable manifests, prompt-label masking, training-process artifact handling, explicit acceptance, stale embedding rejection, local reranking and tokenizer-budget preservation.
+- Learning/admin/chat HTML rendered at 375, 768 and 1440 px without horizontal overflow using the same local Chromium/ASGI method as the earlier validation.
+- Actual teacher generation was NOT run against a paid online API. No user PDF, API key or base-model weights were supplied.
+- Actual Transformers/PEFT parameter updates, GPU/CPU training speed, adapter serving and real embedding/reranker inference have NOT been executed in this development environment. Those are optional dependencies not installed here; process and data flow tests use fixtures/mocks.
+- An industrial model has NOT been trained. Code supports an opt-in local LoRA runner and accepted-adapter endpoint; production quality improvement must be measured with independent data.
+- Fine-tuning of the embedding model itself is NOT implemented in this version. Retrieval improvements are model-compatible token chunking, identity checks, exact-tag preference, hybrid candidates and optional local CrossEncoder reranking.
+- Graceful cancellation terminates the current training subprocess. A hard-killed web process may leave a training process running; operations must inspect remaining processes before retrying after a crash.

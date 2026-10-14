@@ -142,3 +142,8 @@ python -m pip install --no-index --find-links=wheelhouse -r requirements.lock
 - embedding ناموفق: پوشه کامل، وابستگی‌ها و فضای RAM را بررسی کنید؛ برای برگشت متنی متغیر مدل را خالی و سرویس را restart کنید.
 - پردازش متوقف: restart وضعیت processing را به queued برمی‌گرداند؛ خطاهای تکراری را از گزارش سرور بررسی کنید.
 - فراموشی رمز: با دسترسی مدیر سرور `python -m app.cli reset-password USERNAME` اجرا کنید؛ همه نشست‌های آن کاربر بسته می‌شود.
+
+## ۱۱. ارتقا به نسخه ۰.۲
+برنامه را متوقف، از داده‌ها پشتیبان بگیرید، کد را دریافت و سرویس را restart کنید. جداول آموزشی و ستون embedding_profile در startup به‌صورت idempotent افزوده می‌شوند.
+اگر embedding فعال است، همه اسناد را بازپردازش کنید؛ بردار قدیمی پذیرفته نمی‌شود.
+آموزش اختیاری: TRAINING.fa.md؛ ارتقای بازیابی: RETRIEVAL_QUALITY.fa.md.
