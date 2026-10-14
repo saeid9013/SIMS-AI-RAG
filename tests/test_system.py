@@ -170,6 +170,9 @@ def test_hybrid_retrieval_merges_and_excludes_deleted(client,monkeypatch):
     with connect() as db:
         db.execute('UPDATE chunks SET embedding=? WHERE document_id=?',(raw,doc))
     monkeypatch.setattr(retrieval,'EMBED_MODEL','local-test-model')
+    monkeypatch.setattr(retrieval,'profile',lambda:'test-profile')
+    with connect() as db:
+        db.execute("UPDATE chunks SET embedding_profile='test-profile' WHERE document_id=?",(doc,))
     monkeypatch.setattr(retrieval,'encode',lambda texts,query=False:[raw])
     results=retrieval.search('فشار تجهیز چقدر است؟')
     assert len(results)==1 and results[0]['document_id']==doc

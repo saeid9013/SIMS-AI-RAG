@@ -14,12 +14,15 @@ from app.config import UPLOADS
 def client():
     init_db(); attempts.clear()
     with connect() as db:
-        for table in ['history','audit','sessions','chunks_fts','chunks','documents','users']:
+        for table in ['learning_samples','training_runs','learning_jobs','history','audit','sessions','chunks_fts','chunks','documents','users']:
             db.execute(f'DELETE FROM {table}')
         db.execute("UPDATE settings SET value='extractive' WHERE key='mode'")
         db.execute("UPDATE settings SET value='false' WHERE key='online_enabled'")
+        db.execute("UPDATE settings SET value='' WHERE key='active_training_run'")
         db.execute("INSERT INTO users(id,username,password,role) VALUES (1,'admin',?,'admin')",(hash_password('admin-test-password'),))
         db.execute("INSERT INTO users(id,username,password,role) VALUES (2,'reader',?,'user')",(hash_password('reader-test-password'),))
+    import shutil
+    shutil.rmtree(UPLOADS.parent/'training',ignore_errors=True)
     for path in UPLOADS.iterdir():
         path.unlink()
     # Start the real lifespan; worker claims are serialized with explicit transactions.
