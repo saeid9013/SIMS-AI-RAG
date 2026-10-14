@@ -1,0 +1,2 @@
+# Optional; install CPU-only torch first where applicable. Models must be supplied locally.
+sentence-transformers>=5,<6

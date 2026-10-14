@@ -1,0 +1,28 @@
+services:
+  app:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      SIMS_DATA_DIR: /data
+      SIMS_COOKIE_SECURE: ${SIMS_COOKIE_SECURE:-false}
+      SIMS_MAX_UPLOAD_MB: ${SIMS_MAX_UPLOAD_MB:-40}
+      SIMS_MAX_PAGES: ${SIMS_MAX_PAGES:-1000}
+      SIMS_OLLAMA_URL: http://ollama:11434
+      SIMS_ONLINE_BASE_URL: ${SIMS_ONLINE_BASE_URL:-https://api.openai.com/v1}
+      SIMS_ONLINE_API_KEY: ${SIMS_ONLINE_API_KEY:-}
+    volumes:
+      - sims-data:/data
+    restart: unless-stopped
+  ollama:
+    image: ollama/ollama:latest
+    profiles: [local]
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    restart: unless-stopped
+volumes:
+  sims-data:
+  ollama-models:
