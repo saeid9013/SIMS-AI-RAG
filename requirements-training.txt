@@ -1,0 +1,7 @@
+# Optional isolated training/adapter environment. Use an appropriate CPU/CUDA torch wheel.
+-r requirements.txt
+torch>=2.6,<3
+transformers>=4.50,<5
+peft>=0.15,<1
+accelerate>=1.4,<2
+safetensors>=0.5,<1
