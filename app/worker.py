@@ -4,7 +4,7 @@ from pathlib import Path
 from .db import connect
 from .config import UPLOADS, EMBED_MODEL
 from .ingest import extract, normalize
-from .retrieval import encode,profile,index_text,semantic_parts
+from .retrieval import encode,profile,index_text,semantic_parts,embedding_path
 
 logger = logging.getLogger(__name__)
 
@@ -18,9 +18,9 @@ def process_document(doc_id):
     try:
         parts,warnings = extract(UPLOADS/row['storage'],Path(row['storage']).suffix,
                                ocr=row['warnings']=='ocr-requested')
-        parts=semantic_parts(parts) if EMBED_MODEL else parts
-        vectors = encode([text for _,text in parts]) if EMBED_MODEL else None
-        signature=profile() if EMBED_MODEL else ''
+        parts=semantic_parts(parts) if embedding_path() else parts
+        vectors = encode([text for _,text in parts]) if embedding_path() else None
+        signature=profile() if embedding_path() else ''
         with connect() as db:
             # Delete/reprocess actions are blocked while processing; transaction is atomic.
             for i,(location,text) in enumerate(parts):
@@ -45,6 +45,7 @@ class Worker:
             # Never restart costly outbound teacher calls or a training run automatically.
             db.execute("UPDATE learning_jobs SET status='failed',error='سرویس هنگام اجرا متوقف شد؛ پس از بررسی کار جدید بسازید.' WHERE status='running'")
             db.execute("UPDATE training_runs SET status='failed',error='سرویس هنگام آموزش متوقف شد.' WHERE status='running'")
+            db.execute("UPDATE embedding_runs SET status='failed',error='سرویس هنگام آموزش متوقف شد.' WHERE status='running'")
         self.thread.start()
     def run(self):
         while not self.stop.is_set():

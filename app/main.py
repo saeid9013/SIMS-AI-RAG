@@ -17,7 +17,7 @@ from starlette.concurrency import run_in_threadpool
 from . import config
 from .db import init_db, connect, settings, audit
 from .security import session_user, verify_password, hash_password, new_session, revoke
-from .retrieval import search
+from .retrieval import search,embedding_path
 from .providers import answer, ProviderError
 from .worker import Worker
 
@@ -32,7 +32,7 @@ async def lifespan(app):
     yield
     worker.close()
 
-app=FastAPI(title='SIMS-AI',version='0.2.0',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
+app=FastAPI(title='SIMS-AI',version='0.3.0',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
 app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 templates=Jinja2Templates(directory=ROOT/'templates')
 
@@ -93,7 +93,7 @@ def render(request,name,u,**context):
 
 @app.get('/health')
 async def health():
-    return {'status':'ok','version':'0.2.0'}
+    return {'status':'ok','version':'0.3.0'}
 
 @app.get('/login')
 async def login_page(request:Request):
@@ -277,7 +277,7 @@ async def admin_page(request:Request,u=Depends(admin)):
         events=db.execute('SELECT * FROM audit ORDER BY id DESC LIMIT 30').fetchall()
         accepted_runs=db.execute("SELECT id FROM training_runs WHERE status='accepted' ORDER BY id DESC").fetchall()
     return render(request,'admin.html',u,cfg=settings(),users=users,events=events,
-                  embedding=bool(config.EMBED_MODEL),online_key=bool(config.ONLINE_KEY),accepted_runs=accepted_runs)
+                  embedding=bool(embedding_path()),online_key=bool(config.ONLINE_KEY),accepted_runs=accepted_runs)
 
 @app.post('/admin/settings')
 async def change_settings(request:Request,u=Depends(admin)):
@@ -424,8 +424,9 @@ async def cancel_learning(job_id:int,request:Request,u=Depends(admin)):
             raise HTTPException(409,'کار قابل لغو نیست.')
         db.execute("UPDATE learning_jobs SET status='cancelled' WHERE id=?",(job_id,))
         db.execute("UPDATE training_runs SET status='cancelled' WHERE job_id=?",(job_id,))
+        db.execute("UPDATE embedding_runs SET status='cancelled' WHERE job_id=?",(job_id,))
         audit(db,u['id'],'cancel_learning',str(job_id))
-    return redirect('/learning','درخواست لغو ثبت شد. درخواست آنلاین در حال ارسال ممکن است تکمیل شود؛ درخواست جدیدی ارسال نمی‌شود.')
+    return redirect('/embedding' if row['kind'].startswith('embed_') else '/learning','درخواست لغو ثبت شد. درخواست آنلاین در حال ارسال ممکن است تکمیل شود؛ درخواست جدیدی ارسال نمی‌شود.')
 
 @app.post('/learning/runs/{run_id}/accept')
 async def accept_training(run_id:int,request:Request,u=Depends(admin)):
@@ -454,3 +455,87 @@ async def training_artifact(run_id:int,artifact:str,u=Depends(admin)):
     path=run_directory(run_id)/artifact
     if not path.is_file():raise HTTPException(404,'خروجی هنوز ساخته نشده است.')
     return FileResponse(path,filename=f'run-{run_id}-{artifact}',media_type='text/plain' if artifact.endswith('.log') else 'application/json')
+
+@app.get('/embedding')
+async def embedding_page(request:Request,u=Depends(admin)):
+    from .embedding_learning import embedding_ready
+    from .retrieval import embedding_path
+    review=request.query_params.get('review','pending')
+    if review not in ('pending','approved','rejected'):review='pending'
+    try:page=max(1,int(request.query_params.get('page','1')))
+    except ValueError:page=1
+    with connect() as db:
+        datasets=db.execute("SELECT id,status,progress,total,error,created FROM learning_jobs WHERE kind='embed_mine' ORDER BY id DESC LIMIT 50").fetchall()
+        try:dataset_id=int(request.query_params.get('dataset',str(datasets[0]['id'] if datasets else 0)))
+        except ValueError:dataset_id=0
+        pairs=db.execute('SELECT * FROM embedding_pairs WHERE job_id=? AND review=? ORDER BY id LIMIT 20 OFFSET ?',
+                         (dataset_id,review,(page-1)*20)).fetchall()
+        counts={r['review']:r['n'] for r in db.execute('SELECT review,COUNT(*) n FROM embedding_pairs WHERE job_id=? GROUP BY review',(dataset_id,))}
+        runs=[dict(r) for r in db.execute('SELECT * FROM embedding_runs ORDER BY id DESC LIMIT 20')]
+        for run in runs:run['parsed_metrics']=json.loads(run['metrics'])
+    ready,reason=embedding_ready()
+    return render(request,'embedding.html',u,datasets=datasets,dataset_id=dataset_id,pairs=pairs,
+                  counts=counts,runs=runs,ready=ready,reason=reason,review=review,page=page,cfg=settings(),
+                  has_model=bool(embedding_path()))
+
+@app.post('/embedding/mine')
+async def mine_embedding(request:Request,u=Depends(admin)):
+    from .embedding_learning import create_mining_job
+    await form_data(request,u)
+    try:job=create_mining_job(u['id'])
+    except ValueError as exc:raise HTTPException(400,str(exc))
+    return redirect('/embedding',f'نسخه داده #{job} ثبت شد؛ نامزدهای منفی نیاز به بازبینی دارند.')
+
+@app.post('/embedding/pairs/{pair_id}/review')
+async def review_embedding_pair(pair_id:int,request:Request,u=Depends(admin)):
+    form=await form_data(request,u)
+    decision=str(form.get('decision',''))
+    if decision not in ('approved','rejected'):raise HTTPException(400,'تصمیم نامعتبر است.')
+    with connect() as db:
+        row=db.execute('SELECT * FROM embedding_pairs WHERE id=?',(pair_id,)).fetchone()
+        if not row:raise HTTPException(404,'نمونه پیدا نشد.')
+        db.execute('UPDATE embedding_pairs SET review=?,reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP WHERE id=?',
+                   (decision,u['id'],pair_id))
+        audit(db,u['id'],'embedding_pair_review',f'{pair_id}:{decision}')
+    return redirect('/embedding?dataset='+str(row['job_id']))
+
+@app.post('/embedding/train')
+async def train_embedding(request:Request,u=Depends(admin)):
+    from .embedding_learning import create_embedding_run
+    form=await form_data(request,u)
+    if form.get('confirm_training')!='on':raise HTTPException(400,'شروع آموزش embedding را تأیید کنید.')
+    try:run=create_embedding_run(int(form.get('dataset_id','0')),u['id'])
+    except ValueError as exc:raise HTTPException(400,str(exc))
+    return redirect('/embedding',f'آموزش embedding #{run} در صف قرار گرفت.')
+
+@app.post('/embedding/runs/{run_id}/accept')
+async def accept_embedding(request:Request,run_id:int,u=Depends(admin)):
+    from .embedding_learning import accept_run
+    form=await form_data(request,u)
+    if form.get('benchmark_passed')!='on':raise HTTPException(400,'ارزیابی مستقل و عدم افت کیفیت باید تأیید شود.')
+    try:accept_run(run_id,u['id'])
+    except ValueError as exc:raise HTTPException(400,str(exc))
+    return redirect('/embedding','نسخه پذیرفته شد؛ هنوز فعال نشده است.')
+
+@app.post('/embedding/runs/{run_id}/activate')
+async def activate_embedding(request:Request,run_id:int,u=Depends(admin)):
+    from .embedding_learning import activate_run
+    form=await form_data(request,u)
+    if form.get('confirm_reindex')!='on':raise HTTPException(400,'بازپردازش همه اسناد را تأیید کنید.')
+    try:await run_in_threadpool(activate_run,run_id,u['id'])
+    except ValueError as exc:raise HTTPException(400,str(exc))
+    return redirect('/embedding','مدل انتخاب شد و اسناد برای ساخت بردارهای جدید در صف قرار گرفتند؛ وضعیت کتابخانه را بررسی کنید.')
+
+@app.get('/embedding/runs/{run_id}/{artifact}')
+async def embedding_artifact(run_id:int,artifact:str,u=Depends(admin)):
+    from .embedding_learning import embedding_directory
+    if artifact not in ('manifest.json','metrics.json','trainer.log'):raise HTTPException(404,'خروجی نامعتبر است.')
+    with connect() as db:run=db.execute('SELECT * FROM embedding_runs WHERE id=?',(run_id,)).fetchone()
+    if not run:raise HTTPException(404,'نسخه پیدا نشد.')
+    if artifact=='manifest.json':
+        from fastapi.responses import Response
+        return Response(run['manifest'],media_type='application/json',
+                        headers={'Content-Disposition':f'attachment; filename="embedding-{run_id}-manifest.json"'})
+    path=embedding_directory(run_id)/artifact
+    if not path.is_file():raise HTTPException(404,'خروجی هنوز ساخته نشده است.')
+    return FileResponse(path,filename=f'embedding-{run_id}-{artifact}')

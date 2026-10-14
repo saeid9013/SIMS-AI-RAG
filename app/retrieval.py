@@ -12,6 +12,7 @@ from .db import connect
 from .ingest import normalize
 
 _model=None
+_loaded_path=None
 _reranker=None
 _model_lock=threading.Lock()
 _rerank_lock=threading.Lock()
@@ -25,26 +26,47 @@ def terms(question):
     return [w for w in re.findall(r'[^\W_]+(?:[-./][^\W_]+)*',index_text(question))
             if len(w)>1 and w not in STOP][:32]
 
-@lru_cache(maxsize=4)
+def embedding_path():
+    with connect() as db:
+        active=db.execute("SELECT value FROM settings WHERE key='active_embedding_run'").fetchone()
+        if active and active['value']:
+            row=db.execute("SELECT id FROM embedding_runs WHERE id=? AND status='accepted'",(active['value'],)).fetchone()
+            if not row:raise ValueError('نسخه فعال embedding معتبر نیست.')
+            from .embedding_learning import embedding_directory
+            return str(embedding_directory(row['id'])/'model')
+    return EMBED_MODEL
+
+def clear_embedding_cache():
+    global _model,_loaded_path
+    with _model_lock:
+        _model=None;_loaded_path=None
+    _profile_for_path.cache_clear()
+
 def profile():
-    if not EMBED_MODEL:return ''
-    path=Path(EMBED_MODEL).resolve()
+    path=embedding_path()
+    return _profile_for_path(path,config.EMBED_QUERY_PREFIX,config.EMBED_PASSAGE_PREFIX,os.getenv('SIMS_EMBED_VERSION','1')) if path else ''
+
+@lru_cache(maxsize=4)
+def _profile_for_path(model_path,query_prefix,passage_prefix,version):
+    path=Path(model_path).resolve()
     if not path.is_dir():raise ValueError('پوشه مدل embedding موجود نیست.')
     # Conservative version guard: changed path/files/mtime requires explicit reindex.
     files=[(str(p.relative_to(path)),p.stat().st_size,p.stat().st_mtime_ns) for p in sorted(path.rglob('*')) if p.is_file()]
-    value=[str(path),files,config.EMBED_QUERY_PREFIX,config.EMBED_PASSAGE_PREFIX,os.getenv('SIMS_EMBED_VERSION','1')]
+    value=[str(path),files,query_prefix,passage_prefix,version]
     return hashlib.sha256(json.dumps(value).encode()).hexdigest()
 
 def load_embedding_model():
-    global _model
-    if _model is None:
+    global _model,_loaded_path
+    path=embedding_path()
+    if _model is None or (_loaded_path is not None and _loaded_path!=path):
         from sentence_transformers import SentenceTransformer
-        _model=SentenceTransformer(EMBED_MODEL,device='cpu',local_files_only=True,trust_remote_code=False)
+        _model=SentenceTransformer(path,device='cpu',local_files_only=True,trust_remote_code=False)
+        _loaded_path=path
     return _model
 
 def semantic_parts(parts):
     """Split at word boundaries to the actual tokenizer budget; preserve every source character."""
-    if not EMBED_MODEL:return parts
+    if not embedding_path():return parts
     os.environ['HF_HUB_OFFLINE']='1';os.environ['TRANSFORMERS_OFFLINE']='1'
     result=[]
     with _model_lock:
@@ -69,7 +91,7 @@ def semantic_parts(parts):
     return result
 
 def encode(texts,query=False):
-    if not EMBED_MODEL:return None
+    if not embedding_path():return None
     os.environ['HF_HUB_OFFLINE']='1';os.environ['TRANSFORMERS_OFFLINE']='1'
     with _model_lock:
         model=load_embedding_model()
@@ -124,7 +146,10 @@ def search(question,limit=5):
         if tags:
             lexical.sort(key=lambda r:sum(bool(re.search(r'(?<!\w)'+re.escape(t)+r'(?!\w)',index_text(r['text']))) for t in tags),reverse=True)
     semantic=[]
-    if EMBED_MODEL:
+    with connect() as db:
+        ready_count=db.execute("SELECT COUNT(*) FROM chunks c JOIN documents d ON d.id=c.document_id WHERE d.status='ready'").fetchone()[0]
+    if not ready_count:return []
+    if embedding_path():
         signature=profile()
         with connect() as db:
             stale=db.execute("""SELECT COUNT(*) FROM chunks c JOIN documents d ON d.id=c.document_id
